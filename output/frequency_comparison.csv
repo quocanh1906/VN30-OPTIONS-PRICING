@@ -1,0 +1,4 @@
+Frequency,Mean P&L (no cost),Std P&L (no cost),Mean P&L (w/ cost),Std P&L (w/ cost),Cost drag
+daily,0.0047,0.1362,-0.3888,0.1841,0.3935
+weekly,0.0077,0.2735,-0.2454,0.2889,0.2531
+monthly,0.0516,0.5826,-0.1526,0.5911,0.2042
