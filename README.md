@@ -2,7 +2,7 @@
 
 A complete options pricing and risk management framework built on VCB (Vietcombank) — the most liquid stock in the VN30 index. Implements the three industry-standard pricing approaches (Black-Scholes, Binomial Tree, Monte Carlo), implied volatility surface construction, and dynamic delta hedging simulation.
 
-This project directly applies theoretical knowledge from the Imperial College Advanced Options Theory module to real Vietnamese market data, and connects to the structured products risk assessment work done at Techcom Securities.
+This project directly applies theoretical knowledge from the Imperial College, Financial Engineering and Advanced Options Theory modules to real Vietnamese market data, and connects to the structured products risk assessment work done at Techcom Securities.
 
 ---
 
