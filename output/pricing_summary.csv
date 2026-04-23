@@ -1,2 +1,2 @@
-Ticker,Spot,Strike,Maturity,Risk-free rate,Hist vol (30d),BS Call,BS Put,Binomial Call,American Put,EEP,MC Naive Call,MC Antithetic,MC Control,Call Delta,Call Gamma,Call Vega,Call Theta
-VCB,60.56,60.56,0.25,0.045,0.10102404185441347,1.5821179552886662,0.9046359369449384,1.5814969253646547,0.9676764429426467,0.0642,1.56881977233554,1.5776536809595718,1.5821179552886664,0.597923,0.12646685,11.7142,-0.0108
+Ticker,Spot (VND),Strike (VND),Maturity (years),Risk-free rate,σ historical (30d),σ GARCH L1,σ GARCH long-run,GARCH α+β,BS Call (σ_hist),BS Call (σ_garch),BS Put (σ_hist),BS Put (σ_garch),Binomial Call,American Put,EEP,MC Naive Call,MC Antithetic,MC Control,Duan MC Call,Duan MC SE,Call Delta,Call Gamma,Call Vega,Call Theta
+VCB,60560.0,60560.0,0.25,0.045,0.101,0.1917,0.2709,0.9874,1582.0,2656.0,905.0,1979.0,2655.0,2035.0,59.0,2629.0,2648.0,2654.0,2633.0,22.0,0.565648,6.78e-05,11916.048,-16.411

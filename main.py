@@ -1,16 +1,36 @@
 """
 main.py — Full options pricing pipeline.
 
-Runs all five modules in sequence and produces a complete
-pricing and risk analysis report for VCB options.
+Runs the three-pricer stack (Black–Scholes / binomial / Monte Carlo)
+under two different volatility inputs — rolling historical σ and
+GARCH(1,1) — and produces comparison outputs that highlight what
+the choice of vol estimator actually buys you.
 
-Output:
-    output/greeks.png
-    output/binomial_convergence.png
-    output/mc_paths.png
-    output/vol_surface.png
-    output/delta_hedge.png
-    output/pricing_summary.csv
+Pricers in use
+--------------
+  BS      : closed-form, constant σ          → needs a scalar
+  Binomial: tree, constant σ                  → needs a scalar
+  MC      : full GARCH path (Duan 1995)       → needs (ω, α, β, σ²_t)
+
+The BS and binomial price lines can only reflect the vol through
+their scalar input. They therefore use two "levels" of GARCH:
+  Level 1 : GARCH Level-1 forecast σ          (average conditional
+            variance over [0, T] annualised)
+  Level 2 : only the MC pricer uses this — full day-by-day GARCH
+            dynamics under the risk-neutral measure.
+
+See README.md for the full theoretical walk-through.
+
+Outputs
+-------
+  output/greeks.png
+  output/binomial_convergence.png
+  output/mc_paths.png
+  output/vol_surface.png
+  output/vol_comparison.png      ← historical vs GARCH
+  output/endogenous_smile.png    ← GARCH smile from MC
+  output/delta_hedge.png
+  output/pricing_summary.csv
 """
 
 import sys
@@ -18,106 +38,122 @@ import os
 sys.path.insert(0, "src")
 
 import pandas as pd
-import numpy as np
 
-from data import get_model_inputs, get_option_grid
+from data import get_model_inputs
 from black_scholes import (call_price, put_price,
-                            all_greeks, price_surface,
-                            put_call_parity_check)
+                            all_greeks, put_call_parity_check)
 from binomial import (european_price, american_price,
-                      early_exercise_premium, convergence_analysis)
-from monte_carlo import mc_naive, mc_antithetic, mc_control_variate
-from implied_vol import compute_smile, build_vol_surface
-from delta_hedge import (simulate_hedge, rebalance_frequency_comparison,
+                      early_exercise_premium)
+from monte_carlo import (mc_naive, mc_antithetic, mc_control_variate,
+                         mc_garch)
+from implied_vol import garch_smile
+from delta_hedge import (rebalance_frequency_comparison,
                           vol_mismatch_analysis)
 from performance import (plot_greeks, plot_binomial_convergence,
                           plot_mc_paths, plot_vol_surface,
+                          plot_vol_comparison, plot_endogenous_smile,
                           plot_delta_hedge)
 
 print("=" * 60)
 print("VN30 Options Pricing Engine")
 print("=" * 60)
 
-# ── 1. Load market data ─────────────────────────────────────────────────────────
-print("\nStep 1: Loading market data...")
-inputs = get_model_inputs(ticker="VCB", vol_window=30)
-S      = inputs["S"]
-r      = inputs["r"]
-sigma  = inputs["sigma"]
-K      = S        # ATM strike
-T      = 0.25     # 3-month option
+T = 0.25   # 3-month option
+
+# ── 1. Load market data + fit GARCH ─────────────────────────────────────────────
+print("\nStep 1: Loading market data and fitting GARCH(1,1)...")
+inputs       = get_model_inputs(ticker="VCB", vol_window=30, T=T)
+S            = inputs["S"]
+r            = inputs["r"]
+sigma_hist   = inputs["sigma"]           # backward-looking flat vol
+sigma_garch  = inputs["sigma_garch"]     # GARCH Level-1 forecast σ
+garch_params = inputs["garch_params"]    # ω, α, β, σ²_t for Level 2
+K            = S                          # ATM
 
 print(f"\nPricing: ATM {T*12:.0f}-month option on VCB")
-print(f"  S={S:.1f}  K={K:.1f}  r={r*100:.1f}%  σ={sigma*100:.2f}%")
+print(f"  S={S:,.0f} VND  K={K:,.0f} VND  r={r*100:.1f}%")
+print(f"  σ_hist  = {sigma_hist*100:.2f}%  "
+      f"(last {30}d rolling stdev of log returns)")
+print(f"  σ_garch = {sigma_garch*100:.2f}%  "
+      f"(GARCH Level-1 forecast over [0, T])")
 
-# ── 2. Black-Scholes ────────────────────────────────────────────────────────────
-print("\nStep 2: Black-Scholes pricing...")
-C_bs = call_price(S, K, T, r, sigma)
-P_bs = put_price(S, K, T, r, sigma)
+# ── 2. Black-Scholes under both vol inputs ──────────────────────────────────────
+print("\nStep 2: Black-Scholes pricing under both vol inputs...")
+C_hist  = call_price(S, K, T, r, sigma_hist)
+P_hist  = put_price (S, K, T, r, sigma_hist)
+C_garch = call_price(S, K, T, r, sigma_garch)
+P_garch = put_price (S, K, T, r, sigma_garch)
 
-print(f"  Call = {C_bs:.4f}  Put = {P_bs:.4f}")
+print(f"  Historical σ → Call = {C_hist:,.0f}  Put = {P_hist:,.0f}")
+print(f"  GARCH-L1  σ → Call = {C_garch:,.0f}  Put = {P_garch:,.0f}")
 
-pcp = put_call_parity_check(S, K, T, r, sigma)
+pcp = put_call_parity_check(S, K, T, r, sigma_garch)
 print(f"  Put-call parity error: {pcp['Parity error']:.2e}")
 
-call_greeks = all_greeks(S, K, T, r, sigma, "call")
-print(f"  Call Greeks: Δ={call_greeks['Delta']:.3f}  "
-      f"Γ={call_greeks['Gamma']:.5f}  "
-      f"ν={call_greeks['Vega']:.3f}  "
-      f"Θ={call_greeks['Theta']:.4f}")
+call_greeks = all_greeks(S, K, T, r, sigma_garch, "call")
+print(f"  Call Greeks (σ_garch): "
+      f"Δ={call_greeks['Delta']:.3f}  "
+      f"Γ={call_greeks['Gamma']:.2e}  "
+      f"ν={call_greeks['Vega']:,.0f}  "
+      f"Θ={call_greeks['Theta']:,.0f}")
 
 # ── 3. Binomial tree ────────────────────────────────────────────────────────────
-print("\nStep 3: Binomial tree pricing...")
-bin_call = european_price(S, K, T, r, sigma, N=500, option_type="call")
-bin_put  = european_price(S, K, T, r, sigma, N=500, option_type="put")
-am_put   = american_price(S, K, T, r, sigma, N=500, option_type="put")
-eep      = early_exercise_premium(S, K, T, r, sigma)
+print("\nStep 3: Binomial tree pricing (σ_garch)...")
+bin_call = european_price(S, K, T, r, sigma_garch, N=500, option_type="call")
+bin_put  = european_price(S, K, T, r, sigma_garch, N=500, option_type="put")
+am_put   = american_price(S, K, T, r, sigma_garch, N=500, option_type="put")
+eep      = early_exercise_premium(S, K, T, r, sigma_garch)
 
-print(f"  European Call = {bin_call:.4f}  (BS diff: {bin_call-C_bs:+.6f})")
-print(f"  European Put  = {bin_put:.4f}  (BS diff: {bin_put-P_bs:+.6f})")
-print(f"  American Put  = {am_put:.4f}")
-print(f"  Early exercise premium = {eep['Early Exercise Premium']:.4f} "
+print(f"  European Call = {bin_call:,.0f} VND (BS diff: {bin_call-C_garch:+.2f})")
+print(f"  European Put  = {bin_put:,.0f} VND (BS diff: {bin_put-P_garch:+.2f})")
+print(f"  American Put  = {am_put:,.0f} VND")
+print(f"  Early exercise premium = {eep['Early Exercise Premium']:,.0f} VND "
       f"({eep['Premium as % of Euro']:.2f}% of European)")
 
-# ── 4. Monte Carlo ──────────────────────────────────────────────────────────────
-print("\nStep 4: Monte Carlo pricing (10,000 paths)...")
-mc_naive_res = mc_naive(S, K, T, r, sigma, n_paths=10000, option_type="call")
-mc_anti_res  = mc_antithetic(S, K, T, r, sigma,
-                               n_paths=10000, option_type="call")
-mc_ctrl_res  = mc_control_variate(S, K, T, r, sigma,
+# ── 4. Monte Carlo: three variance-reduction methods + Duan GARCH ───────────────
+print("\nStep 4: Monte Carlo pricing (σ_garch, 10,000 paths)...")
+mc_naive_res = mc_naive          (S, K, T, r, sigma_garch,
+                                   n_paths=10000, option_type="call")
+mc_anti_res  = mc_antithetic     (S, K, T, r, sigma_garch,
+                                   n_paths=10000, option_type="call")
+mc_ctrl_res  = mc_control_variate(S, K, T, r, sigma_garch,
                                    n_paths=10000, option_type="call")
 
-print(f"  Naive MC   : {mc_naive_res['price']:.4f} "
-      f"± {mc_naive_res['std_error']:.4f}")
-print(f"  Antithetic : {mc_anti_res['price']:.4f} "
-      f"± {mc_anti_res['std_error']:.4f}")
-print(f"  Control CV : {mc_ctrl_res['price']:.4f} "
-      f"± {mc_ctrl_res['std_error']:.4f}")
-print(f"  BS True    : {C_bs:.4f}")
+print(f"  Naive MC   : {mc_naive_res['price']:,.0f} VND "
+      f"± {mc_naive_res['std_error']:,.0f}")
+print(f"  Antithetic : {mc_anti_res ['price']:,.0f} VND "
+      f"± {mc_anti_res ['std_error']:,.0f}")
+print(f"  Control CV : {mc_ctrl_res ['price']:,.0f} VND "
+      f"± {mc_ctrl_res ['std_error']:,.0f}")
+print(f"  BS (σ_g)   : {C_garch:,.0f} VND")
 
-# ── 5. Implied volatility ───────────────────────────────────────────────────────
-print("\nStep 5: Implied volatility surface...")
-iv_surf, _ = build_vol_surface(S, r,
-                                atm_vol=sigma,
-                                skew=-0.10,
-                                smile_curve=0.05)
-print("  Vol surface computed (synthetic smile)")
-print(f"  ATM IV: {sigma*100:.2f}%")
-print(f"  80% ATM IV (3M): {iv_surf['T=3m'].iloc[0]*100:.2f}% "
-      f"(skew premium)")
+print("\nStep 4b: Duan GARCH Monte Carlo (Level 2: full GARCH path)...")
+mc_duan = mc_garch(S, K, T, r, garch_params,
+                   n_paths=30000, option_type="call")
+print(f"  Duan MC Call (full GARCH path): "
+      f"{mc_duan['price']:,.0f} VND ± {mc_duan['std_error']:,.0f}")
+print(f"  Average realised σ across paths: "
+      f"{mc_duan['avg_realised_vol']*100:.2f}%")
+print(f"  Δ vs BS(σ_garch) = {mc_duan['price'] - C_garch:+,.0f} VND  "
+      f"(non-zero because BS is flat-vol; Duan captures clustering)")
+
+# ── 5. Endogenous smile from GARCH MC ───────────────────────────────────────────
+print("\nStep 5: Backing out implied-vol smile from Duan MC prices...")
+smile = garch_smile(S, r, T, garch_params, n_paths=30000)
+print(smile[["moneyness", "garch_mc_price", "implied_vol"]].to_string(index=False))
 
 # ── 6. Delta hedging ────────────────────────────────────────────────────────────
-print("\nStep 6: Delta hedging simulation (500 paths)...")
-freq_df = rebalance_frequency_comparison(S, K, T, r, sigma, n_paths=500)
+print("\nStep 6: Delta hedging simulation (σ_garch, 500 paths)...")
+freq_df = rebalance_frequency_comparison(S, K, T, r, sigma_garch, n_paths=500)
 print(freq_df[["Frequency", "Mean P&L (no cost)",
                "Mean P&L (w/ cost)", "Cost drag"]].to_string(index=False))
 
 vm_df = vol_mismatch_analysis(S, K, T, r,
-                               implied_vol=sigma,
-                               realised_vols=[sigma*x
+                               implied_vol=sigma_garch,
+                               realised_vols=[sigma_garch*x
                                for x in [0.5, 0.75, 1.0, 1.25, 1.5]],
                                n_paths=500)
-print(f"\n  Vol mismatch: when realised < implied → profitable")
+print(f"\n  Vol mismatch: realised < implied (σ_garch) → profitable short vol")
 print(vm_df[["Realised Vol (%)", "Vol Spread (%)",
              "Mean P&L", "% Profitable"]].to_string(index=False))
 
@@ -126,34 +162,46 @@ print("\nStep 7: Saving summary...")
 os.makedirs("output", exist_ok=True)
 
 summary = pd.DataFrame([{
-    "Ticker"          : "VCB",
-    "Spot"            : S,
-    "Strike"          : K,
-    "Maturity"        : T,
-    "Risk-free rate"  : r,
-    "Hist vol (30d)"  : sigma,
-    "BS Call"         : C_bs,
-    "BS Put"          : P_bs,
-    "Binomial Call"   : bin_call,
-    "American Put"    : am_put,
-    "EEP"             : eep["Early Exercise Premium"],
-    "MC Naive Call"   : mc_naive_res["price"],
-    "MC Antithetic"   : mc_anti_res["price"],
-    "MC Control"      : mc_ctrl_res["price"],
-    "Call Delta"      : call_greeks["Delta"],
-    "Call Gamma"      : call_greeks["Gamma"],
-    "Call Vega"       : call_greeks["Vega"],
-    "Call Theta"      : call_greeks["Theta"],
+    "Ticker"              : "VCB",
+    "Spot (VND)"          : round(S, 0),
+    "Strike (VND)"        : round(K, 0),
+    "Maturity (years)"    : T,
+    "Risk-free rate"      : r,
+    "σ historical (30d)"  : round(sigma_hist, 4),
+    "σ GARCH L1"          : round(sigma_garch, 4),
+    "σ GARCH long-run"    : round(garch_params["long_run_vol_annual"], 4),
+    "GARCH α+β"           : round(garch_params["persistence"], 4),
+    "BS Call (σ_hist)"    : round(C_hist, 0),
+    "BS Call (σ_garch)"   : round(C_garch, 0),
+    "BS Put (σ_hist)"     : round(P_hist, 0),
+    "BS Put (σ_garch)"    : round(P_garch, 0),
+    "Binomial Call"       : round(bin_call, 0),
+    "American Put"        : round(am_put, 0),
+    "EEP"                 : round(eep["Early Exercise Premium"], 0),
+    "MC Naive Call"       : round(mc_naive_res["price"], 0),
+    "MC Antithetic"       : round(mc_anti_res ["price"], 0),
+    "MC Control"          : round(mc_ctrl_res ["price"], 0),
+    "Duan MC Call"        : round(mc_duan     ["price"], 0),
+    "Duan MC SE"          : round(mc_duan     ["std_error"], 0),
+    "Call Delta"          : call_greeks["Delta"],
+    "Call Gamma"          : call_greeks["Gamma"],
+    "Call Vega"           : call_greeks["Vega"],
+    "Call Theta"          : call_greeks["Theta"],
 }])
 summary.to_csv("output/pricing_summary.csv", index=False)
-print("  Saved to output/pricing_summary.csv")
+smile.to_csv  ("output/endogenous_smile.csv", index=False)
+print("  Saved pricing_summary.csv and endogenous_smile.csv")
 
 # ── 8. Generate all charts ──────────────────────────────────────────────────────
 print("\nStep 8: Generating charts...")
-plot_greeks(S, r, sigma, "call")
-plot_binomial_convergence(S, K, T, r, sigma)
-plot_mc_paths(S, r, sigma, T, n_paths=100)
-plot_vol_surface(S, r, sigma)
-plot_delta_hedge(S, K, T, r, sigma)
+plot_greeks             (S, r, sigma_garch, "call")
+plot_binomial_convergence(S, K, T, r, sigma_garch)
+plot_mc_paths           (S, r, sigma_garch, T, n_paths=100)
+plot_vol_surface        (S, r, sigma_garch)
+plot_vol_comparison     (inputs["returns"], garch_params,
+                         sigma_hist=sigma_hist, T=T)
+plot_endogenous_smile   (S, r, T, garch_params,
+                         sigma_hist=sigma_hist, sigma_garch=sigma_garch)
+plot_delta_hedge        (S, K, T, r, sigma_garch)
 
 print("\nDone! All outputs saved to output/")

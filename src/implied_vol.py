@@ -74,13 +74,19 @@ def implied_vol(market_price, S, K, T, r,
     -------
     float : implied volatility, or NaN if no solution found
     """
-    # Check if price is within no-arbitrage bounds
-    intrinsic = max(S - K * np.exp(-r * T), 0) if option_type == "call" \
-                else max(K * np.exp(-r * T) - S, 0)
+    # Check if price is within no-arbitrage bounds.
+    # Lower bound: discounted intrinsic value (forward intrinsic).
+    # Upper bound: call ≤ S  /  put ≤ K·e^(-rT)
+    if option_type == "call":
+        intrinsic   = max(S - K * np.exp(-r * T), 0)
+        upper_bound = S
+    else:
+        intrinsic   = max(K * np.exp(-r * T) - S, 0)
+        upper_bound = K * np.exp(-r * T)
 
     if market_price <= intrinsic:
         return np.nan
-    if market_price >= S:
+    if market_price >= upper_bound:
         return np.nan
 
     # Objective: BS(σ) - market_price = 0
@@ -238,6 +244,66 @@ def build_vol_surface(S, r, atm_vol=0.20, skew=-0.10,
         pd.DataFrame(iv_surface, index=index),
         pd.DataFrame(price_surface, index=index),
     )
+
+
+def garch_smile(S, r, T, garch_params,
+                moneyness=None, n_paths=20000, seed=42,
+                option_type="call"):
+    """
+    Endogenous volatility smile derived from GARCH Monte Carlo.
+
+    The earlier `compute_smile` / `build_vol_surface` functions
+    generate a smile synthetically from assumed skew / curvature
+    parameters, then recover those same parameters by inverting BS
+    on the noisy prices. That's methodologically sound as a
+    demonstration but **circular** — the recovered smile is by
+    construction equal (up to noise) to what you put in.
+
+    This function is NOT circular. It:
+      1. Prices options across strikes using the Duan GARCH MC.
+      2. Inverts Black–Scholes on each MC price to get the BS-
+         equivalent implied vol.
+      3. Returns that curve.
+
+    Because GARCH produces a non-log-normal terminal distribution
+    (heavy tails from vol clustering), inverting the BS formula on
+    those prices gives a genuine non-flat smile — one that is an
+    output of the model rather than an input. This is the first
+    time `implied_vol` in this project refers to something real.
+
+    Parameters
+    ----------
+    garch_params : dict from garch_vol.fit_garch
+    moneyness    : list of K/S ratios; default spans 0.80 → 1.20
+    n_paths      : MC paths per strike
+
+    Returns
+    -------
+    DataFrame with columns:
+        moneyness, K, garch_mc_price, implied_vol
+    """
+    from monte_carlo import mc_garch
+
+    if moneyness is None:
+        moneyness = [0.80, 0.85, 0.90, 0.95, 1.0,
+                     1.05, 1.10, 1.15, 1.20]
+
+    rows = []
+    for m in moneyness:
+        K  = S * m
+        mc = mc_garch(S, K, T, r, garch_params,
+                      n_paths=n_paths, seed=seed,
+                      option_type=option_type)
+        iv = implied_vol(mc["price"], S, K, T, r, option_type)
+        rows.append({
+            "moneyness"     : m,
+            "K"             : round(K, 2),
+            "garch_mc_price": round(mc["price"], 4),
+            "std_error"     : round(mc["std_error"], 4),
+            "implied_vol"   : round(iv, 4) if np.isfinite(iv) else np.nan,
+        })
+
+    return pd.DataFrame(rows)
 
 
 def term_structure(S, K, r, atm_vol=0.20,

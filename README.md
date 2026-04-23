@@ -1,247 +1,288 @@
 # VN30 Options Pricing Engine
 
-A complete options pricing and risk management framework built on VCB (Vietcombank) — the most liquid stock in the VN30 index. Implements the three industry-standard pricing approaches (Black-Scholes, Binomial Tree, Monte Carlo), implied volatility surface construction, and dynamic delta hedging simulation.
+An options pricing and risk-management framework for Vietnamese equities, built on VCB (Vietcombank) as the most liquid VN30 constituent. It implements three pricers (Black–Scholes, binomial tree, Monte Carlo), two volatility estimators (rolling historical and GARCH(1,1)), dynamic delta hedging, and — critically — a **Duan (1995) GARCH Monte Carlo pricer** that generates an endogenous volatility smile without relying on any listed-options market data.
 
 This project directly applies theoretical knowledge from the Imperial College, Financial Engineering and Advanced Options Theory modules to real Vietnamese market data, and connects to the structured products risk assessment work done at Techcom Securities.
 
----
-
-## Key Results
-
-### Pricing Comparison — ATM 3-Month Call on VCB
-*(S = 60.6, K = 60.6, T = 0.25y, r = 4.5%, σ = 10.10%)*
-
-| Method | Price | Notes |
-|---|---|---|
-| Black-Scholes | 1.5821 | Analytical closed-form |
-| Binomial (N=500) | 1.5815 | Error: 0.0006 (0.04%) |
-| Monte Carlo Naive | 1.5688 ± 0.0204 | 10,000 paths |
-| Monte Carlo Antithetic | 1.5777 ± 0.0134 | 34% variance reduction |
-| Monte Carlo Control CV | 1.5821 ± 0.0000 | Matches BS exactly |
-
-Put-call parity error: 0.00e+00 — confirms model consistency.
+The last point matters. Vietnam has no liquid listed-options market, so there is no implied-volatility surface to borrow from. Most textbook options projects start from an IV input; we cannot. Everything vol-related here is estimated from the historical return series.
 
 ---
 
-### Greeks (ATM Call, 3M)
+## Table of Contents
 
-| Greek | Value | Interpretation |
-|---|---|---|
-| Delta (Δ) | 0.598 | Option gains 0.598 for every 1 VND move in VCB |
-| Gamma (Γ) | 0.127 | Delta changes by 0.127 per 1 VND move |
-| Vega (ν) | 11.714 | Option gains 11.714 for 1% increase in vol |
-| Theta (Θ) | -0.0108 | Option loses 0.0108 per calendar day |
-
----
-
-### Binomial Tree — American vs European Put
-
-| | Price |
-|---|---|
-| European Put | 0.9040 |
-| American Put | 0.9677 |
-| Early Exercise Premium | 0.0642 (7.11% of European) |
-
-The American put commands a 7.11% premium over the European — rational early exercise has material value even for a 3-month option at current Vietnamese rates.
+1. [The Core Problem: No Liquid Options → No IV](#the-core-problem)
+2. [Design Principle: What Each Pricer Does & Why](#design-principle)
+3. [Assumptions and Where They Break](#assumptions)
+4. [The Volatility-Input Hierarchy (Level 1 vs Level 2)](#vol-hierarchy)
+5. [Why Duan GARCH MC Cannot Live Inside Black–Scholes](#why-duan-is-mc)
+6. [Module-by-Module Walk-Through](#walkthrough)
+7. [Reproducing the Results](#reproducing)
+8. [Output Artifacts](#outputs)
+9. [Limitations / Things a Real Desk Would Add](#limitations)
 
 ---
 
-### Monte Carlo Convergence
+<a name="the-core-problem"></a>
+## 1. The Core Problem: No Liquid Options → No IV
 
-Demonstrates the 1/√N convergence rate — to halve the error, you need 4× more paths:
+In a mature market (S&P 500, HSI, FTSE), an options pricing stack takes implied volatility from observable market prices and feeds it into a model. Calibration is the work. In Vietnam, there is no such input:
 
-| N Paths | Naive SE | Antithetic SE | Control SE |
+- No listed equity options.
+- No volatility futures, no VIX-equivalent for the VN30.
+- OTC warrants exist but are thinly quoted and heavily dealer-driven.
+
+So the volatility number has to be estimated from historical returns. Any project that pretends to "imply" vol from synthetic prices (generate prices from an assumed smile, then recover that same smile) is solving a circular problem — the recovered vol *is* the input by construction. This project is honest about that:
+
+- The synthetic-smile module (`build_vol_surface`) is retained as a methodology demonstration but is clearly marked as circular.
+- The **real** smile this project produces comes from the GARCH Monte Carlo (§5).
+
+---
+
+<a name="design-principle"></a>
+## 2. Design Principle: What Each Pricer Does & Why
+
+Three pricing approaches, each earning its place:
+
+| Pricer | What it needs | What it's good at | What it can't do |
 |---|---|---|---|
-| 100 | 0.1958 | 0.1457 | 0.0 |
-| 1,000 | 0.0656 | 0.0407 | 0.0 |
-| 10,000 | 0.0204 | 0.0134 | 0.0 |
-| 50,000 | 0.0092 | 0.0060 | 0.0 |
+| Black–Scholes (closed-form) | one scalar σ | speed; exact Greeks | anything time-varying |
+| Binomial tree (CRR) | one scalar σ | American exercise; intuition | exotic payoffs; path-dependence |
+| Monte Carlo | either scalar σ or a full variance process | any payoff; path-dependence; **real GARCH dynamics** | early exercise (naturally); slow convergence |
 
-Asian option prices at 45% discount to European — averaging dampens the effective volatility significantly, relevant for commodity-linked structured products.
-
----
-
-### Implied Volatility Surface
-
-Synthetic surface constructed with:
-- ATM vol: 10.10% (30-day historical from VCB)
-- Skew: -10% (negative equity skew — OTM puts command premium)
-- Smile curvature: +5%
-
-The surface shows the classic **put skew** — OTM puts at 80% ATM carry ~20% implied vol vs 10% for ATM options at 3-month maturity. The skew flattens significantly at longer maturities (2-year surface is nearly flat), consistent with mean reversion reducing the probability of extreme moves over longer horizons.
-
-**Key finding:** The smile directly contradicts Black-Scholes' constant volatility assumption. In practice, options desks maintain a vol surface and interpolate from it rather than using a single σ input to BS.
+The MC pricer is the only one that can ingest the *full* GARCH process — the other two are mathematically restricted to constant σ. This is not an implementation limitation; it's a theorem. See §5.
 
 ---
 
-### Delta Hedging Simulation
+<a name="assumptions"></a>
+## 3. Assumptions and Where They Break
 
-**Rebalancing frequency tradeoff** (500 paths, short ATM call):
+Every options model rests on assumptions that are violated in practice. Being explicit matters more than pretending otherwise.
 
-| Frequency | Mean P&L (no cost) | Mean P&L (w/ cost) | Cost Drag |
+### 3.1 Black–Scholes (1973)
+
+| Assumption | Reality (Vietnam) | Our mitigation |
+|---|---|---|
+| Geometric Brownian Motion for S | Returns exhibit vol clustering, fat tails | Duan MC relaxes this |
+| Constant volatility σ | Vol clusters and mean-reverts | GARCH Level-1 σ scalar; Duan MC full path |
+| Constant risk-free rate r | 4.5% VND-gov-bond approximation | Held fixed, flagged |
+| No dividends | VCB pays ~0.8% quarterly dividends | **Not yet modelled — documented limitation** |
+| Continuous trading, no frictions | HOSE has tick sizes, intraday caps, price limits | Acknowledged; delta-hedge sim uses real VN costs |
+| European exercise only | Moot (no listed market) | Binomial handles American when needed |
+
+### 3.2 Binomial (CRR)
+
+Same as BS for pricing, plus the extra assumption that the risk-neutral up-move and down-move are given by `u = exp(σ√Δt)`, `d = 1/u`. This is a CRR choice; Jarrow–Rudd or Tian trees give slightly different convergence. At N = 500 steps the error to BS is <0.1% in our setup.
+
+### 3.3 Monte Carlo
+
+- Standard MC (`mc_naive`, `mc_antithetic`, `mc_control_variate`) assumes GBM with constant σ — same as BS; variance-reduction methods change the *estimator*, not the *model*.
+- Duan MC (`mc_garch`) assumes the risk-neutralised GARCH(1,1) process of Duan (1995). Key simplification: **λ = 0** (no volatility risk premium priced). This is reasonable as a first pass in a market with no listed options but would be recalibrated from traded prices in a market that has them.
+
+### 3.4 Vietnamese market-specific
+
+- **Transaction costs**: 0.125% commission + 0.10% sales tax on sell side. Used in the delta-hedge P&L sim.
+- **Price units**: HOSE quotes in thousands of VND (60.56 = 60,560 VND). `data.py` scales on load so every downstream number is in actual VND — no unit confusion possible inside the code.
+
+---
+
+<a name="vol-hierarchy"></a>
+## 4. The Volatility-Input Hierarchy
+
+Three levels of vol input, in order of fidelity:
+
+### Level 0 — Rolling historical σ  *(baseline)*
+
+```
+σ_hist = stdev(last 30 log-returns) · √252
+```
+
+One backward-looking scalar. Equal-weighted window. Ignores vol clustering completely.
+
+**What it gets wrong**: If yesterday closed at 2% daily move and the 30 days before were 0.5%, rolling 30d σ barely budges. Everyone on the desk knows vol just spiked, but the number doesn't reflect it.
+
+### Level 1 — GARCH(1,1) scalar forecast
+
+```
+Fit:     σ²_t = ω + α · ε²_{t-1} + β · σ²_{t-1}
+Forecast: project σ²_{t+h} forward for h = 1..⌈T·252⌉ days
+Average:  σ_{GARCH} = √(mean(σ²_{t+h}) · 252)
+```
+
+Still a single scalar — good enough for BS and the binomial tree. But this scalar *knows* about the current vol regime (via σ²_t) and the long-run level (via ω/(1−α−β)), and it decays from one to the other at rate (α+β) per day.
+
+**What it gets right**: vol clustering, mean reversion.
+**What it still gets wrong**: the terminal distribution is still log-normal by assumption in BS/binomial; the smile is still flat.
+
+For VCB at end-2024: Level 0 → 10.1%, Level 1 → 19.2%. Level 1 is almost 2× Level 0 because the rolling 30d sample happens to sit in a calm regime while the long-run is materially higher (27%).
+
+### Level 2 — Duan (1995) GARCH Monte Carlo
+
+The full GARCH process is simulated path-by-path under the risk-neutral measure. Each path's variance evolves day-by-day following the fitted recursion. No collapse to a scalar.
+
+```
+For each MC path, for each trading day t:
+  log-return    r_t   = r_daily - ½σ²_t + σ_t · ε*_t,      ε*_t ~ N(0,1)
+  variance update  σ²_{t+1} = ω + α · σ²_t · ε*_t² + β · σ²_t
+```
+
+This is the only pricer that produces a **non-flat** smile without imposing one. See §5 for why only MC can do this, and the `output/endogenous_smile.png` panel for what the smile looks like on VCB.
+
+### Direct comparison on VCB (ATM 3M call)
+
+| Vol input | σ (%) | BS call (VND) | MC call (VND) |
 |---|---|---|---|
-| Daily | +0.0047 | -0.3888 | 0.3935 |
-| Weekly | +0.0077 | -0.2454 | 0.2531 |
-| Monthly | +0.0516 | -0.1526 | 0.2042 |
+| Level 0: historical 30d | 10.10 | 1,582 | — |
+| Level 1: GARCH scalar | 19.17 | 2,656 | — |
+| Level 2: Duan GARCH path | *endogenous* | — | 2,633 ± 22 |
 
-For VCB at σ=10.1%, **transaction costs dominate over gamma risk**. Less frequent rebalancing is optimal — the cost savings outweigh the increase in hedging error. This finding reverses for high-volatility stocks where gamma losses would dominate.
-
-**Volatility mismatch — the core of vol trading:**
-
-| Realised Vol | Implied Vol | Vol Spread | Mean P&L | % Profitable |
-|---|---|---|---|---|
-| 5.1% | 10.1% | +5.1% | +0.5786 | 100.0% |
-| 7.6% | 10.1% | +2.5% | +0.2971 | 99.6% |
-| 10.1% | 10.1% | 0.0% | +0.0047 | 49.4% |
-| 12.6% | 10.1% | -2.5% | -0.2930 | 3.2% |
-| 15.2% | 10.1% | -5.1% | -0.5942 | 0.2% |
-
-When realised vol equals implied vol, the strategy is approximately break-even (49.4% profitable). A dealer who sells options at 10.1% implied vol and realised vol turns out to be 15.2% will lose nearly every time. This is the fundamental risk in options dealing — vol forecasting accuracy determines profitability, not directional market views.
+The huge gap between Level 0 and Level 1 (+68%) is precisely the information the rolling-window estimator throws away. Level 1 and Level 2 agree at ATM (as they must); their difference shows up in the wings.
 
 ---
 
-## Theoretical Framework
+<a name="why-duan-is-mc"></a>
+## 5. Why Duan GARCH MC Cannot Live Inside Black–Scholes
 
-### Black-Scholes (1973)
-Closed-form solution for European options under five assumptions:
-- Geometric Brownian Motion price dynamics
-- Constant volatility σ
-- Constant risk-free rate r
-- No dividends or transaction costs
-- Continuous trading
+This comes up repeatedly, so it's worth stating the theorem clearly:
 
-```
-Call = S × N(d1) - K × e^(-rT) × N(d2)
-d1 = [ln(S/K) + (r + σ²/2)T] / (σ√T)
-d2 = d1 - σ√T
-```
+> Black–Scholes has a closed-form solution **because** σ is constant. If you allow variance to follow a path-dependent process (as GARCH does), the BS integral no longer has an analytical form. You must simulate paths.
 
-Despite its simplifying assumptions — particularly constant volatility which the vol smile directly contradicts — BS remains the industry standard quoting convention. All options are quoted in "implied vol" terms using the BS formula as the translation layer.
+More concretely:
 
-### Cox-Ross-Rubinstein Binomial Tree
-Discrete-time model that converges to Black-Scholes as N→∞. Handles American options naturally through backward induction with early exercise check at each node. With N=500 steps, error vs BS is less than 0.04%.
+- BS price = `S·N(d1) − K·e^(−rT)·N(d2)`, where `d1`, `d2` depend on **one** σ.
+- Duan GARCH dynamics → terminal `S_T` distribution is *not* log-normal (it has extra kurtosis and possibly skew from the variance clustering).
+- `N(d1)` is a cdf of a Gaussian. It cannot represent that non-Gaussian distribution.
 
-### Monte Carlo Simulation
-Simulates thousands of GBM paths and averages discounted payoffs. The most flexible method — naturally extends to path-dependent payoffs (Asian, barrier, lookback) that have no analytical solution.
+So the MC pricer *is* the Level-2 pricer. There is no separate "BS-with-Duan" version to implement — the MC engine that evolves the GARCH process is exactly that object.
 
-Three variance reduction techniques implemented:
-- **Antithetic variates**: pairs each path with its mirror, reduces variance ~34%
-- **Control variates**: exploits correlation with BS analytical price, nearly eliminates variance for near-ATM options
+**Corollary**: if you back out BS-equivalent IV from Duan MC prices (strike by strike), you get a smile. That smile is the BS cdf's "error bar" against a non-log-normal truth. It is a genuine empirical output — not an assumed parameter.
 
-### Implied Volatility
-The volatility σ* that makes BS(σ*) = observed market price. Extracted numerically using Brent's root-finding method. The resulting smile/skew surface shows the market's departure from BS assumptions — particularly the higher probability assigned to downside tail events (crash risk) than the normal distribution implies.
-
-### Delta Hedging
-Dynamic replication of a sold option by trading the underlying. In continuous time, the hedge is perfect. In discrete time, hedging error arises from:
-- **Gamma risk**: delta changes between rebalances, larger moves create larger errors
-- **Transaction costs**: every rebalance incurs commission and sales tax
-
-P&L of delta-hedged short option ≈ ½ × Γ × (ΔS)² - Θ × Δt
-
-Gamma term: lose when stock moves (short gamma exposure)
-Theta term: gain from time decay (short option → long theta)
+This is what makes `src/implied_vol.py:garch_smile()` non-circular for the first time in this project.
 
 ---
 
-## Data
+<a name="walkthrough"></a>
+## 6. Module-by-Module Walk-Through
 
-**Underlying**: VCB (Vietcombank) daily close prices
-- Source: vnstock (KBS source), reused from VN30-MA-Crossover project
-- Period: 2015–2024 (2,376 daily observations)
-- Price unit: thousands of VND (HOSE convention)
+### `src/data.py`
 
-**Volatility inputs**:
-- 30-day historical: 10.10% (primary input)
-- 60-day historical: 10.16%
-- 252-day historical: 16.04%
-- Term structure is downward sloping — short-term vol elevated vs long-term
+Loads VCB daily close prices from the sibling VN30-MA-Crossover project (no re-download), computes log returns, rolling historical vol at 30/60/252d windows, and — if `fit_garch_model=True` — also fits a GARCH(1,1) model and returns its Level-1 scalar forecast plus the full param dict for Level-2 use.
 
-**Risk-free rate**: 4.5% (approximate Vietnamese 1-year government bond yield, State Bank of Vietnam, 2024)
+HOSE quotes in thousands of VND; `data.py` multiplies by `PRICE_UNIT = 1000` at load so downstream code sees real VND everywhere.
 
-**Implied volatility surface**: Synthetic — generated using a parametric smile model with realistic skew (-10%) and curvature (+5%) applied to the historical ATM vol. Vietnamese equity options market is nascent with limited liquidity, making real market IV extraction impractical. The methodology is real; the surface is illustrative.
+### `src/garch_vol.py` *(new)*
+
+Thin wrapper around the `arch` library. Three functions:
+
+- `fit_garch(returns)` → ω, α, β, persistence, long-run vol, current σ²_t.
+- `garch_sigma_for_horizon(params, T)` → Level-1 scalar for BS/binomial.
+- `in_sample_conditional_vol(params)` → σ_t series for diagnostic plots.
+
+The project uses zero-mean GARCH(1,1) with Gaussian innovations. This is the textbook default; Student-t innovations would be a natural extension.
+
+### `src/black_scholes.py`
+
+Closed-form call, put, put-call parity check, and all five Greeks (Δ, Γ, ν, Θ, ρ). No changes to the math — the module is as theoretically clean as BS gets.
+
+### `src/binomial.py`
+
+Cox-Ross-Rubinstein tree with `u = exp(σ√Δt)`, `d = 1/u`. Prices European (backward induction) and American (early-exercise check at every node). Converges to BS for N ≥ 200 steps.
+
+### `src/monte_carlo.py`
+
+Four pricers:
+
+| Function | Model | Variance reduction |
+|---|---|---|
+| `mc_naive` | GBM, const σ | none |
+| `mc_antithetic` | GBM, const σ | mirror paths |
+| `mc_control_variate` | GBM, const σ | control = `S_T` (not the payoff!) |
+| `mc_garch` | **Duan 1995 GARCH(1,1)** | none by default |
+
+The control-variate fix matters: using the payoff itself as the control makes β → 1 and collapses the estimator to `bs_true` with zero standard error — a silent bug. The correct control is the terminal stock price `S_T`, which has known risk-neutral expectation `S·e^(rT)`.
+
+### `src/implied_vol.py`
+
+- `implied_vol(price, S, K, T, r, type)`: Brent root-find; correctly bounded for both calls (`price ≤ S`) and puts (`price ≤ K·e^(−rT)`).
+- `compute_smile / build_vol_surface`: **synthetic** (skew, smile_curve imposed; retained as demonstration).
+- `garch_smile`: **real** — prices each strike via Duan MC, inverts BS on the price, returns BS-equivalent IV curve.
+
+### `src/delta_hedge.py`
+
+Simulates dealer-side short call + dynamic delta hedge. Uses Vietnamese transaction-cost parameters. Produces:
+
+- P&L distribution across N paths.
+- Rebalance-frequency comparison (daily / weekly / monthly; gamma risk vs cost trade-off).
+- Vol-mismatch scenario: implied vs realised vol → confirms the classic "short vol profits when realised < implied" result.
+
+### `src/performance.py`
+
+All visualisations. Two new charts added:
+
+- `plot_vol_comparison`: time-series of rolling vs GARCH conditional σ; forward term structure; return-distribution diagnostic (fat tails vs Gaussian).
+- `plot_endogenous_smile`: the money chart — flat historical / flat GARCH-scalar lines vs. the curved GARCH MC smile.
 
 ---
 
-## Assumptions and Limitations
-
-### Assumptions
-- GBM dynamics for underlying (log-normal returns)
-- Constant volatility within each pricing call (not across strikes — the surface addresses this)
-- Vietnamese 1-year government bond yield as risk-free rate proxy
-- No dividends (VCB does pay dividends — minor pricing error)
-- Prices in thousands of VND (HOSE standard convention)
-
-### Limitations
-- **No real options market data**: Vietnamese equity options market is nascent. The vol surface is synthetic and for illustration only
-- **Constant volatility in BS**: contradicted by the smile — in practice, desks use local vol or stochastic vol models (Heston) for accurate surface-consistent pricing
-- **American options**: MC implementation does not support American exercise (requires Longstaff-Schwartz LSM)
-- **Single underlying**: full portfolio Greeks and cross-asset correlations not implemented
-- **No jumps**: GBM assumes continuous paths — jump-diffusion (Merton) would better capture crash risk visible in the skew
-
----
-
-## Project Structure
-
-```
-VN30-Options-Pricing/
-├── main.py                ← runs full pipeline, all 5 modules
-├── src/
-│   ├── data.py            ← load VCB prices, compute vol inputs
-│   ├── black_scholes.py   ← BS pricing, all 5 Greeks, price surface
-│   ├── binomial.py        ← CRR tree, American options, convergence
-│   ├── monte_carlo.py     ← naive MC, antithetic, control variates, Asian
-│   ├── implied_vol.py     ← IV extraction, smile, vol surface
-│   ├── delta_hedge.py     ← hedging simulation, frequency comparison, vol mismatch
-│   └── performance.py     ← all charts and visualisation
-├── data/
-│   └── processed/         ← vol series (generated, not tracked)
-└── output/
-    ├── greeks.png
-    ├── binomial_convergence.png
-    ├── mc_paths.png
-    ├── vol_surface.png
-    ├── delta_hedge.png
-    └── pricing_summary.csv
-```
-
----
-
-## How to Run
+<a name="reproducing"></a>
+## 7. Reproducing the Results
 
 ```bash
-# Install dependencies
-pip install pandas numpy matplotlib scipy vnstock
-
-# Run full pipeline (uses existing VCB price data)
+cd VN30-Options-Pricing
 python main.py
 ```
 
-> **Note:** Requires VCB price data from the VN30-MA-Crossover project.
-> Run `python src/data.py` in that project first if data is not available.
+Expected runtime: ~90s on a laptop (dominated by 30k-path MC runs across 9 strikes for the smile).
+
+Requirements: `numpy pandas scipy matplotlib arch`. The `arch` package is the only non-standard dependency (used for GARCH fitting).
+
+Each module is also runnable standalone for inspection:
+
+```bash
+python src/garch_vol.py          # fit GARCH on VCB, show param + σ forecasts
+python src/monte_carlo.py        # compare naive/antithetic/control
+python src/delta_hedge.py        # single-path hedge trace + frequency sweep
+```
 
 ---
 
-## Connection to Other Projects
+<a name="outputs"></a>
+## 8. Output Artifacts
 
-| Project | Focus | Connection |
-|---|---|---|
-| [VN30-Momentum](https://github.com/quocanh1906/VN30-Momentum) | Equity momentum | Underlying data source |
-| [VN30-MA-Crossover](https://github.com/quocanh1906/VN30-MA-Crossover) | Event-driven execution | Provides daily price data |
-| [VN30-Market-Risk](https://github.com/quocanh1906/VN30-Market-Risk) | VaR, GARCH, stress testing | Complements options Greeks with portfolio-level risk |
-| **VN30-Options-Pricing** | Derivatives pricing | Prices the instruments the risk projects hedge |
+| File | What it shows |
+|---|---|
+| `output/pricing_summary.csv` | All ATM prices side-by-side under σ_hist and σ_garch |
+| `output/endogenous_smile.csv` | Moneyness × MC price × BS-inverted IV |
+| `output/greeks.png` | Δ, Γ, ν, Θ, ρ as functions of spot |
+| `output/binomial_convergence.png` | Price and error vs tree-size N |
+| `output/mc_paths.png` | Simulated GBM fans + terminal-price histogram |
+| `output/vol_surface.png` | Synthetic smile surface (methodology demo) |
+| `output/vol_comparison.png` | **Historical vs GARCH — 3-panel vol diagnostic** |
+| `output/endogenous_smile.png` | **Flat-vol assumption vs curved GARCH smile** |
+| `output/delta_hedge.png` | Hedge P&L distribution / freq trade-off / vol mismatch |
+
+---
+
+<a name="limitations"></a>
+## 9. Limitations / Things a Real Desk Would Add
+
+Honest accounting of what this project does *not* yet do:
+
+1. **Dividends** — VCB pays quarterly dividends (~0.8% each); BS with `q = 0` biases calls up and puts down by ~3% cumulative for a 3-month option. Easy to add as `q` parameter throughout.
+2. **Stochastic rates** — r is held constant at 4.5%. For options >1 year this matters; for 3-month calls it doesn't move prices much.
+3. **Jump risk** — Neither GBM nor GARCH(1,1) captures discrete jumps (earnings, policy announcements). A Merton jump-diffusion or Bates model would price tail risk better; the machinery to add it is already in the MC engine.
+4. **Student-t / non-Gaussian GARCH innovations** — Empirical Vietnamese returns have kurtosis > 3; GARCH with Gaussian shocks underestimates tails. `arch` supports `dist='t'`.
+5. **Duan's λ (volatility risk premium)** — Set to 0. In a market with listed options, λ would be calibrated to traded prices. Here there's nothing to calibrate against.
+6. **Longstaff–Schwartz** for American MC — currently we rely on the binomial tree for American pricing. For higher-dimensional problems (basket / multi-asset), LSM in the MC engine would be the right extension.
+7. **No liquid VN30 option benchmark** — There's literally no market price to validate against. The best cross-check we can do is intra-method: BS ↔ binomial ↔ Duan-MC-at-ATM should all agree, and they do.
+
+None of these are hard to add once there's an actual trading use-case demanding them. The project is structured so each module sits behind a clean function boundary — drop-in replacements are straightforward.
 
 ---
 
 ## References
 
-- Black, F. & Scholes, M. (1973). *The Pricing of Options and Corporate Liabilities.* Journal of Political Economy, 81(3), 637–654.
-- Cox, J., Ross, S. & Rubinstein, M. (1979). *Option Pricing: A Simplified Approach.* Journal of Financial Economics, 7(3), 229–263.
-- Hull, J. (2018). *Options, Futures, and Other Derivatives* (10th ed.). Pearson.
-- Glasserman, P. (2003). *Monte Carlo Methods in Financial Engineering.* Springer.
-
----
-
-## Author
-
-Vu Quoc Anh Nguyen — MSc Risk Management & Financial Engineering, Imperial College London
-GitHub: [quocanh1906](https://github.com/quocanh1906)
+- Black, F. & Scholes, M. (1973). *The Pricing of Options and Corporate Liabilities.*
+- Cox, J., Ross, S. & Rubinstein, M. (1979). *Option Pricing: A Simplified Approach.*
+- Bollerslev, T. (1986). *Generalised Autoregressive Conditional Heteroscedasticity.*
+- Duan, J.-C. (1995). *The GARCH Option Pricing Model.*
+- Glasserman, P. (2003). *Monte Carlo Methods in Financial Engineering* — Ch. 4 (variance reduction).

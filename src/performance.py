@@ -273,6 +273,159 @@ def plot_vol_surface(S, r, sigma):
     print("Saved to output/vol_surface.png")
 
 
+def plot_vol_comparison(returns, garch_params, sigma_hist, T):
+    """
+    Side-by-side comparison of volatility estimators.
+
+    Panel 1 — Time-series vol:
+        rolling 30d/60d historical vs GARCH in-sample σ_t.
+        GARCH reacts faster to clusters; rolling windows are smooth
+        and lag behind.
+
+    Panel 2 — Vol term structure (looking forward from today):
+        historical σ is a single scalar (flat). GARCH forecasts a
+        term structure that mean-reverts toward long-run vol.
+
+    Panel 3 — Return distribution diagnostic:
+        log-returns histogram vs. Gaussian of matching std. The
+        fatter empirical tails are what justifies a GARCH-style
+        variance process over a constant-σ assumption.
+    """
+    from garch_vol import (in_sample_conditional_vol,
+                           garch_sigma_for_horizon)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle("Volatility Input Comparison — Historical vs GARCH",
+                 fontsize=13, fontweight="bold")
+
+    # ── Panel 1: time-series vol ───────────────────────────────────
+    ax = axes[0]
+    roll30  = returns.rolling(30).std()  * np.sqrt(252)
+    roll60  = returns.rolling(60).std()  * np.sqrt(252)
+    garch_t = in_sample_conditional_vol(garch_params)
+
+    ax.plot(roll30.index,  roll30.values  * 100, color="steelblue",
+            alpha=0.7, linewidth=1, label="Rolling 30d")
+    ax.plot(roll60.index,  roll60.values  * 100, color="orange",
+            alpha=0.7, linewidth=1, label="Rolling 60d")
+    ax.plot(garch_t.index, garch_t.values * 100, color="crimson",
+            linewidth=1.2, label="GARCH σ_t (in-sample)")
+    ax.axhline(garch_params["long_run_vol_annual"] * 100,
+               color="black", linestyle="--", linewidth=1, alpha=0.7,
+               label=f"GARCH long-run "
+                     f"({garch_params['long_run_vol_annual']*100:.1f}%)")
+    ax.set_title("Conditional Volatility over Time")
+    ax.set_ylabel("Annualised σ (%)")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # ── Panel 2: forward vol term structure ───────────────────────
+    ax = axes[1]
+    horizons = np.array([1/12, 2/12, 3/12, 6/12, 9/12, 1.0, 1.5, 2.0])
+    garch_term = np.array([garch_sigma_for_horizon(garch_params, t)
+                           for t in horizons])
+
+    ax.plot(horizons * 12, garch_term * 100, color="crimson",
+            marker="o", linewidth=1.5, label="GARCH forecast σ(T)")
+    ax.axhline(sigma_hist * 100, color="steelblue",
+               linestyle="--", linewidth=1.5,
+               label=f"Historical {sigma_hist*100:.1f}% (flat)")
+    ax.axhline(garch_params["long_run_vol_annual"] * 100,
+               color="black", linestyle=":", linewidth=1, alpha=0.7,
+               label=f"GARCH long-run "
+                     f"({garch_params['long_run_vol_annual']*100:.1f}%)")
+    ax.axvline(T * 12, color="grey", linestyle=":", alpha=0.6)
+    ax.set_xlabel("Horizon T (months)")
+    ax.set_ylabel("Annualised σ over [0, T] (%)")
+    ax.set_title("Forward Term Structure of σ")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # ── Panel 3: return distribution vs Gaussian ──────────────────
+    ax = axes[2]
+    from scipy.stats import norm as _norm
+    r_sample = returns.values * 100
+    ax.hist(r_sample, bins=80, density=True, color="steelblue",
+            alpha=0.6, label="Empirical log-returns")
+    xs = np.linspace(r_sample.min(), r_sample.max(), 300)
+    ax.plot(xs, _norm.pdf(xs, loc=0, scale=r_sample.std()),
+            color="red", linewidth=2,
+            label=f"Gaussian (σ={r_sample.std():.2f}%)")
+    ax.set_xlabel("Daily log-return (%)")
+    ax.set_ylabel("Density")
+    ax.set_title("Why Not Constant σ? — Fat Tails in Returns")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    os.makedirs("output", exist_ok=True)
+    plt.savefig("output/vol_comparison.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved to output/vol_comparison.png")
+
+
+def plot_endogenous_smile(S, r, T, garch_params,
+                          sigma_hist, sigma_garch):
+    """
+    The key theoretical payoff chart: show that GARCH produces a
+    real volatility smile that constant-σ BS cannot.
+
+    Three curves:
+      1. Flat horizontal line at historical σ (BS assumption).
+      2. Flat horizontal line at GARCH scalar σ (Level-1 still flat:
+         collapsing to a scalar loses the smile).
+      3. Curve from GARCH MC prices, inverted through BS to recover
+         implied vols (Level 2: the smile emerges endogenously).
+
+    The gap between (2) and (3) is the visual proof that Level 1 is
+    an approximation and Level 2 is the theoretically clean pricer.
+    """
+    from implied_vol import garch_smile
+
+    smile = garch_smile(S, r, T, garch_params,
+                        moneyness=[0.80, 0.85, 0.90, 0.95, 1.0,
+                                   1.05, 1.10, 1.15, 1.20],
+                        n_paths=30000)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    fig.suptitle(
+        "Endogenous Smile from GARCH Monte Carlo (Duan 1995)",
+        fontsize=13, fontweight="bold"
+    )
+
+    money_pct = smile["moneyness"].values * 100
+    ax.plot(money_pct, smile["implied_vol"].values * 100,
+            color="crimson", marker="o", linewidth=2, markersize=7,
+            label="Level 2: BS-equivalent IV from GARCH MC prices")
+
+    ax.axhline(sigma_hist * 100, color="steelblue",
+               linestyle="--", linewidth=1.5,
+               label=f"Historical σ = {sigma_hist*100:.2f}% "
+                     f"(what BS assumes)")
+    ax.axhline(sigma_garch * 100, color="darkorange",
+               linestyle="--", linewidth=1.5,
+               label=f"Level 1: GARCH scalar σ = {sigma_garch*100:.2f}% "
+                     f"(still flat)")
+    ax.axvline(100, color="black", linestyle=":", alpha=0.6)
+
+    ax.set_xlabel("Moneyness K/S (%)")
+    ax.set_ylabel("BS-equivalent implied vol (%)")
+    ax.set_title(
+        f"T = {T*12:.0f}-month options on VCB — "
+        f"the smile is model output, not input",
+        fontsize=10,
+    )
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("output/endogenous_smile.png", dpi=150,
+                bbox_inches="tight")
+    plt.show()
+    print("Saved to output/endogenous_smile.png")
+    return smile
+
+
 def plot_delta_hedge(S, K, T, r, sigma):
     """
     Plot delta hedging results:

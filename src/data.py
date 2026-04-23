@@ -26,6 +26,9 @@ RISK_FREE_RATE = 0.045  # 4.5% per annum
 # Default underlying — use VN30 ETF as proxy for index options
 DEFAULT_TICKER = "VCB"  # most liquid VN30 stock as example
 
+# HOSE quotes prices in thousands of VND (e.g. 60.56 → 60,560 VND)
+PRICE_UNIT = 1000
+
 
 def load_prices(ticker=DEFAULT_TICKER,
                 data_path=None):
@@ -62,7 +65,7 @@ def load_prices(ticker=DEFAULT_TICKER,
         if path and os.path.exists(path):
             df = pd.read_csv(path, index_col=0, parse_dates=True)
             if ticker in df.columns:
-                prices = df[ticker].dropna()
+                prices = df[ticker].dropna() * PRICE_UNIT
                 print(f"✓ Loaded {ticker}: {len(prices)} observations "
                       f"({prices.index[0].date()} to "
                       f"{prices.index[-1].date()}) from {path}")
@@ -104,23 +107,33 @@ def compute_historical_vol(prices, windows=[30, 60, 252]):
 
 def get_model_inputs(ticker=DEFAULT_TICKER,
                      vol_window=30,
-                     data_path=None):
+                     T=0.25,
+                     data_path=None,
+                     fit_garch_model=True):
     """
     Get all inputs needed for options pricing models.
 
-    Returns a dict with:
-    - S  : current spot price (last available close)
-    - r  : risk-free rate (Vietnamese 1Y govt bond yield)
-    - sigma : historical volatility (annualised)
-    - prices : full price series
-    - returns : log return series
-    - vol_series : rolling volatility series
+    Returns two σ estimates side by side so downstream code can
+    compare them:
+
+    - `sigma`        : historical σ over the last `vol_window` days
+                       (backward-looking, flat, reflects one recent
+                       regime)
+    - `sigma_garch`  : GARCH(1,1) Level-1 forecast — average
+                       conditional variance over [0, T] annualised
+                       (forward-looking, regime-aware, respects
+                       mean reversion)
+
+    The full `garch_params` dict is also returned so the Duan MC
+    (Level 2) pricer can evolve the variance process day-by-day.
 
     Parameters
     ----------
-    ticker     : stock ticker
-    vol_window : lookback for volatility estimate in days
-    data_path  : optional explicit path to price data
+    ticker          : stock ticker
+    vol_window      : lookback for historical-vol baseline (days)
+    T               : horizon for GARCH scalar forecast (years)
+    data_path       : optional explicit path to price data
+    fit_garch_model : skip GARCH fit if False (faster for tests)
     """
     prices      = load_prices(ticker, data_path)
     log_returns = np.log(prices / prices.shift(1)).dropna()
@@ -130,22 +143,38 @@ def get_model_inputs(ticker=DEFAULT_TICKER,
     sigma = log_returns.tail(vol_window).std() * np.sqrt(252)
     r     = RISK_FREE_RATE
 
+    garch_params = None
+    sigma_garch  = None
+    if fit_garch_model:
+        from garch_vol import fit_garch, garch_sigma_for_horizon
+        garch_params = fit_garch(log_returns)
+        sigma_garch  = garch_sigma_for_horizon(garch_params, T)
+
     print(f"\nModel inputs for {ticker}:")
-    print(f"  Spot price (S)    : {S:,.0f} VND")
-    print(f"  Risk-free rate (r): {r*100:.1f}%")
-    print(f"  Hist. vol ({vol_window}d)  : {sigma*100:.2f}%")
-    print(f"  30d vol           : {vol_df['vol_30d'].iloc[-1]*100:.2f}%")
-    print(f"  60d vol           : {vol_df['vol_60d'].iloc[-1]*100:.2f}%")
-    print(f"  252d vol          : {vol_df['vol_252d'].iloc[-1]*100:.2f}%")
+    print(f"  Spot price (S)     : {S:,.0f} VND")
+    print(f"  Risk-free rate (r) : {r*100:.1f}%")
+    print(f"  Hist. vol ({vol_window}d)    : {sigma*100:.2f}%")
+    print(f"  30d vol (baseline) : {vol_df['vol_30d'].iloc[-1]*100:.2f}%")
+    print(f"  60d vol            : {vol_df['vol_60d'].iloc[-1]*100:.2f}%")
+    print(f"  252d vol           : {vol_df['vol_252d'].iloc[-1]*100:.2f}%")
+    if garch_params is not None:
+        print(f"  GARCH σ_t (annual) : "
+              f"{garch_params['last_vol_annual']*100:.2f}%")
+        print(f"  GARCH long-run     : "
+              f"{garch_params['long_run_vol_annual']*100:.2f}%")
+        print(f"  GARCH forecast σ   : {sigma_garch*100:.2f}%  "
+              f"(avg over [0, {T:.2f}y])")
 
     return {
-        "ticker"    : ticker,
-        "S"         : S,
-        "r"         : r,
-        "sigma"     : sigma,
-        "prices"    : prices,
-        "returns"   : log_returns,
-        "vol_series": vol_df,
+        "ticker"       : ticker,
+        "S"            : S,
+        "r"            : r,
+        "sigma"        : sigma,
+        "sigma_garch"  : sigma_garch,
+        "garch_params" : garch_params,
+        "prices"       : prices,
+        "returns"      : log_returns,
+        "vol_series"   : vol_df,
     }
 
 
